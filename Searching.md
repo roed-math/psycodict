@@ -488,9 +488,9 @@ The algorithm depends on the arguments:
   - If the count is **not cached**, it must materialize the match set to sample
     uniformly: it fetches all matching labels (`projection=0`) or all matching
     ids (any other projection) unsorted, records the resulting count in the
-    counts table as a side effect, and returns a `random.choice` (re-fetching
-    the full row by id if a non-label projection was requested).  `None` if the
-    set is empty.
+    counts table when count-saving is enabled (see the side-effect note below),
+    and returns a `random.choice` (re-fetching the full row by id if a
+    non-label projection was requested).  `None` if the set is empty.
 
 - **Empty `query`, no `pick_first`** — an id-based retry loop.  `random` reads
   `MIN(id)` and `MAX(id)`, and up to 100 times picks a random id uniformly in
