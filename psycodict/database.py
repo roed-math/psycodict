@@ -2191,12 +2191,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     self.create_table(tablename, search_columns, None, force_description=False)
 
             for tablename in self.tablenames:
-                included = []
-
                 searchfile = data_folder / (tablename + ".txt")
                 if not searchfile.exists():
                     continue
-                included.append(tablename)
 
                 table = self[tablename]
 
@@ -2208,15 +2205,11 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     )
 
                 countsfile = data_folder / (tablename + "_counts.txt")
-                if countsfile.exists():
-                    included.append(tablename + "_counts")
-                else:
+                if not countsfile.exists():
                     countsfile = None
 
                 statsfile = data_folder / (tablename + "_stats.txt")
-                if statsfile.exists():
-                    included.append(tablename + "_stats")
-                else:
+                if not statsfile.exists():
                     statsfile = None
 
                 indexesfile = data_folder / (tablename + "_indexes.txt")
@@ -2242,13 +2235,12 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                             constraintsfile,
                             metafile,
                         ),
-                        included,
                     )
                 )
                 tablenames.append(tablename)
             print("Reloading {0}".format(", ".join(tablenames)))
             failures = []
-            for table, filedata, included in file_list:
+            for table, filedata in file_list:
                 try:
                     table.reload(
                         *filedata,
@@ -2265,10 +2257,13 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     else:
                         traceback.print_exc()
                         failures.append(table)
-            for table, filedata, included in file_list:
+            for table, filedata in file_list:
                 if table in failures:
                     continue
-                table.reload_final_swap(tables=included, metafile=filedata[-1], sep=sep)
+                # The tables reload staged, which include the counts and
+                # stats tables it refreshed or carried over even when there
+                # were no files for them
+                table.reload_final_swap(metafile=filedata[-1], sep=sep)
 
         if failures:
             print("Reloaded %s" % (", ".join(tablenames)))

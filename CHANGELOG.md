@@ -134,6 +134,20 @@ migration note.
 Roughly two dozen fixes landed while splitting the search/extras tables and
 hardening standalone use; the highlights:
 
+- `stats_valid` in `meta_tables` now means something: `refresh_stats` sets it
+  back to true (writes only ever set it to false before, so most tables read
+  false whatever the state of their statistics), `update_from_file` without a
+  refresh and `reload` with carried-over statistics set it to false, and a
+  reload from exported files takes the source's value from the metafile.
+- `reload(..., restat=False)` with `saving` on no longer swaps in empty counts
+  and stats tables, which discarded the record of which statistics to keep, so
+  that no later `refresh_stats` could rebuild them; the live ones are carried
+  over.
+- `reload_all` publishes the statistics `reload` refreshed for a table with no
+  counts and stats files, instead of swapping in only the tables it had files
+  for and leaving the refreshed statistics orphaned in `_tmp` tables (the live
+  ones stayed stale).
+
 - Counts-table totals are now maintained correctly on writes rather than drifting
   out of sync. (#61–#87)
 - `text[]` values no longer corrupt on `COPY` because of quoting. (#61–#87)

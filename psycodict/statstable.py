@@ -1805,6 +1805,9 @@ ORDER BY v.ord LIMIT %s"""
         - ``reset_None_to_1`` -- change threshold None to 1 in stored statistics
         - ``suffix`` -- appended to the table name when computing and storing stats.
             Used when reloading a table.
+
+        Refreshing the live tables (no ``suffix``) sets ``stats_valid`` in
+        ``meta_tables`` back to true.
         """
         self._logger.info("Refreshing statistics on %s" % self.search_table)
         t0 = time.time()
@@ -1844,6 +1847,11 @@ ORDER BY v.ord LIMIT %s"""
                 # Refresh total in meta_tables
                 self._set_total(self._slow_count({}, suffix=suffix, extra=False), suffix=suffix)
             self.refresh_null_counts(suffix=suffix)
+            if not suffix:
+                # The live statistics now describe the live data.  A refresh
+                # into _tmp tables only becomes valid once they are swapped
+                # in, which the caller records.
+                self.table._restore_stats()
             self._logger.info("Refreshed statistics in %.3f secs" % (time.time() - t0))
 
     def status(self, reset_None_to_1=False):

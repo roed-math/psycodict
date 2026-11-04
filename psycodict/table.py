@@ -1176,11 +1176,22 @@ class PostgresTable(PostgresBase):
         """
         This function should be called when the statistics are invalidated by an insertion or update.
         """
-        if self._stats_valid:
-            # Only need to interact with database in this case.
-            updater = SQL("UPDATE meta_tables SET stats_valid = false WHERE name = %s")
-            self._execute(updater, [self.search_table], silent=True)
-            self._stats_valid = False
+        # The cached flag cannot be trusted to skip the update: another
+        # connection may have refreshed the statistics (and so set the flag)
+        # since this object read meta_tables.  The condition makes the update
+        # a no-op when the flag is already false.
+        updater = SQL("UPDATE meta_tables SET stats_valid = false WHERE name = %s AND stats_valid")
+        self._execute(updater, [self.search_table], silent=True)
+        self._stats_valid = False
+
+    def _restore_stats(self):
+        """
+        Record that the statistics describe the current data, as they do once
+        ``refresh_stats`` has regenerated them.
+        """
+        updater = SQL("UPDATE meta_tables SET stats_valid = true WHERE name = %s AND NOT stats_valid")
+        self._execute(updater, [self.search_table], silent=True)
+        self._stats_valid = True
 
     def _break_order(self):
         """
@@ -1476,7 +1487,11 @@ class PostgresTable(PostgresBase):
                     ordered = self.resort(suffix=suffix)
                 else:
                     ordered = False
-                if restat and self.stats.saving:
+                refreshed = restat and self.stats.saving
+                if not refreshed:
+                    # The data changed and nothing recomputes the statistics
+                    self._break_stats()
+                else:
                     if not inplace:
                         for table in [self.stats.counts, self.stats.stats]:
                             if not self._table_exists(physical_table_name(table, lifecycle="_tmp")):
@@ -1491,7 +1506,7 @@ class PostgresTable(PostgresBase):
                     # and the _tmp tables are left orphaned.  reload builds its
                     # swap list the same way.
                     tables = [self.search_table]
-                    if restat and self.stats.saving:
+                    if refreshed:
                         tables += [self.stats.counts, self.stats.stats]
                     if self.stats.counts in tables:
                         # _clone built the _tmp counts table with a bare LIKE,
@@ -1503,6 +1518,9 @@ class PostgresTable(PostgresBase):
                     self._swap_in_tmp(tables)
                     if ordered:
                         self._set_ordered()
+                    if refreshed:
+                        # The statistics refreshed into _tmp are live now
+                        self._restore_stats()
                 # Delete the temporary table used to load the data
                 drop_tmp()
                 logging["logid"] = logid
@@ -2258,29 +2276,53 @@ class PostgresTable(PostgresBase):
                 else:
                     ordered = False
 
-                # Ensure stats/counts tables are backed up and new empty ones created
+                # Stage _tmp counts and stats tables, so that the live ones
+                # are backed up in the swap
+                refreshed = self.stats.saving and restat and (countsfile is None or statsfile is None)
                 if self.stats.saving:
                     for table in [self.stats.counts, self.stats.stats]:
                         if table not in tables:
+                            tmp_table = physical_table_name(table, lifecycle=suffix)
                             # Create _tmp version if it doesn't exist
-                            if not self._table_exists(physical_table_name(table, lifecycle=suffix)):
-                                self._clone(table, physical_table_name(table, lifecycle=suffix))
+                            if not self._table_exists(tmp_table):
+                                self._clone(table, tmp_table)
+                            if not refreshed:
+                                # Carry the live contents over.  An empty table
+                                # would lose the record of which statistics are
+                                # kept along with their values, so that no later
+                                # refresh_stats could regenerate them.
+                                self._execute(SQL("DELETE FROM {0}").format(Identifier(tmp_table)))
+                                self._execute(SQL("INSERT INTO {0} SELECT * FROM {1}").format(
+                                    Identifier(tmp_table), Identifier(table)))
                             # Add to tables list so it gets backed up in the swap
                             tables.append(table)
 
-                    # Only refresh stats if restat is True
-                    if restat and (countsfile is None or statsfile is None):
+                    if refreshed:
                         self.stats.refresh_stats(suffix=suffix)
 
                 if self.stats.counts in tables:
                     # create index on counts table
                     self._create_counts_indexes(suffix=suffix)
 
+                # Whether the statistics swapped in describe the new data:
+                # refreshed ones do, and supplied files are taken to (unless a
+                # metafile says otherwise), while ones carried over describe
+                # the old data.
+                if refreshed:
+                    stats_valid = True
+                elif self.stats.saving and countsfile is not None and statsfile is not None:
+                    stats_valid = None if metafile is not None else True
+                else:
+                    stats_valid = False
                 if final_swap:
                     self.reload_final_swap(tables=tables,
                                            metafile=metafile,
-                                           ordered=ordered)
-                elif metafile is not None and not silence_meta:
+                                           ordered=ordered,
+                                           stats_valid=stats_valid)
+                else:
+                    # Remembered for the deferred reload_final_swap
+                    self._staged_reload = (tables, ordered, stats_valid)
+                if not final_swap and metafile is not None and not silence_meta:
                     print("Warning: since the final swap was not requested, we have not updated meta_tables")
                     print("when performing the final swap with reload_final_swap, pass the metafile as an argument to update the meta_tables")
                 print("Reloaded %s in %.3f secs" % (self.search_table, time.time() - now_overall))
@@ -2294,17 +2336,31 @@ class PostgresTable(PostgresBase):
                 stats=(statsfile is not None),
             )
 
-    def reload_final_swap(self, tables=None, metafile=None, ordered=False, sep="|"):
+    def reload_final_swap(self, tables=None, metafile=None, ordered=False, sep="|", stats_valid=None):
         """
         Renames the ``_tmp`` versions of ``tables`` to the live versions,
         and updates the corresponding meta_tables row if ``metafile`` is provided.
 
         INPUT:
 
-        - ``tables`` -- list of strings (optional), of the tables to be renamed.  If None is provided, renames all the tables ending in ``_tmp``
+        - ``tables`` -- list of strings (optional), of the tables to be renamed.
+          If None is provided, renames the tables staged by the preceding
+          ``reload(..., final_swap=False)``, or failing that all the tables
+          ending in ``_tmp``
         - ``metafile`` -- a string (optional), giving a file containing the meta information for the table.
         - ``sep`` -- a character (default ``|``) to separate columns
+        - ``stats_valid`` -- a boolean (optional), whether the statistics
+          swapped in describe the new data, recorded in meta_tables after the
+          metafile is applied.  If None, the value ``reload`` determined is
+          used when ``tables`` is None, and otherwise the flag is left alone.
         """
+        staged = getattr(self, "_staged_reload", None)
+        self._staged_reload = None
+        if tables is None and staged is not None:
+            tables, staged_ordered, staged_valid = staged
+            ordered = ordered or staged_ordered
+            if stats_valid is None:
+                stats_valid = staged_valid
         with DelayCommit(self, silence=True):
             if tables is None:
                 # _swap_in_tmp takes the base names and appends the _tmp
@@ -2321,6 +2377,9 @@ class PostgresTable(PostgresBase):
                 self.reload_meta(metafile, sep=sep)
             if ordered:
                 self._set_ordered()
+            if stats_valid is not None:
+                self._execute(SQL("UPDATE meta_tables SET stats_valid = %s WHERE name = %s"),
+                              [stats_valid, self.search_table])
             # The swapped-in table's row count bears no relation to the old
             # total, so recount and store it before the reinitialization
             # below reads meta_tables.

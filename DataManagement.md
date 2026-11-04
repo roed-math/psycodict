@@ -108,7 +108,7 @@ These mutate the live table directly.  They are convenient for small edits; for 
  * **`update(query, changes, resort=False, restat=True)`** — a plain SQL `UPDATE` of every row matching `query`; `changes` maps column names to constants.
  * **`delete(query, restat=True)`** — deletes every row matching `query` and decrements `total`.
 
-**Statistics invalidation.**  Any write that can change the data calls `_break_stats`, which sets `meta_tables.stats_valid = false` so that cached statistics are known to be stale.  If the table has `saving` on and you left `restat=True`, statistics are refreshed at the end of the call; otherwise they are simply marked invalid.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
+**Statistics invalidation.**  Any write that can change the data calls `_break_stats`, which sets `meta_tables.stats_valid = false` so that cached statistics are known to be stale.  If the table has `saving` on and you left `restat=True`, statistics are refreshed at the end of the call, and `refresh_stats` sets `stats_valid` back to true; otherwise they are simply marked invalid.  `upsert` never refreshes, so after a batch of upserts call `stats.refresh_stats()` yourself.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
 
 ### Resorting is disabled
 
@@ -171,7 +171,7 @@ Note the id column first, the `integer[]` written as `{0,0}`, the `jsonb` keys r
  3. restore the primary key and rebuild indexes/constraints on `name_tmp` from `meta_indexes`/`meta_constraints` (or from `indexesfile`/`constraintsfile`);
  4. **final swap**: rename the live `name` to `name_old<n>` and `name_tmp` to `name`.
 
-Because of the swap, the previous table survives as **`name_old<n>`**, where `<n>` is the next unused backup number — the live table is never mutated in place, so a failed load leaves the original untouched.  A second reload produces `name_old2` (and warns you that backups are accumulating).  When `saving` is on, the `_counts` and `_stats` tables are cloned and swapped the same way.
+Because of the swap, the previous table survives as **`name_old<n>`**, where `<n>` is the next unused backup number — the live table is never mutated in place, so a failed load leaves the original untouched.  A second reload produces `name_old2` (and warns you that backups are accumulating).  When `saving` is on, the `_counts` and `_stats` tables are cloned and swapped the same way.  Each is loaded from `countsfile`/`statsfile` if given; otherwise, with `restat` (the default when either file is missing), the statistics are regenerated for the new data, and without it the live counts and statistics are carried over unchanged.  `stats_valid` records which happened: true after a refresh, false for carried-over statistics, and for statistics loaded from files whatever the `metafile` says (true if there is none) -- so a `reload_all` from a `copy_to` export inherits the source database's flag.
 
 Sharp edges — what reload does **not** preserve:
 
